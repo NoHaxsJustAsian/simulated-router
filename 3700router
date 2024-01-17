@@ -1,0 +1,626 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse, socket, json, select
+
+class Router:
+
+    relations = {}
+    sockets = {}
+    ports = {}
+    forwarding_table = []
+    update_messages = []
+
+    '''
+    Initializes the router.
+    Params:
+        asn - the AS number of this router
+        connections - the connections of this router
+    '''
+    def __init__(self, asn, connections):
+        print("Router at AS %s starting up" % asn)
+        self.asn = asn
+        for relationship in connections:
+            port, neighbor, relation = relationship.split("-")
+            self.sockets[neighbor] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sockets[neighbor].bind(('localhost', 0))
+            self.ports[neighbor] = int(port)
+            self.relations[neighbor] = relation
+        for relationship in connections:
+            port, neighbor, relation = relationship.split("-")
+            self.send(neighbor, json.dumps({ "type": "handshake", "src": self.our_addr(neighbor), "dst": neighbor, "msg": {}  }))
+
+    '''
+    Returns the IP address of the given network.
+    Params:
+        dst - the network to get the IP address of
+    '''
+    def our_addr(self, dst):
+        quads = list(int(qdn) for qdn in dst.split('.'))
+        quads[3] = 1
+        return "%d.%d.%d.%d" % (quads[0], quads[1], quads[2], quads[3])
+
+    '''
+    Sends the given message to the given network.
+    Params:
+        network - the network to send the message to
+        message - the message to send
+    '''
+    def send(self, network, message):
+        self.sockets[network].sendto(message.encode('utf-8'), ('localhost', self.ports[network]))  
+    
+    '''
+    Runs the router.
+    '''
+    def run(self):
+        while True:
+            socks = select.select(self.sockets.values(), [], [], 0.1)[0]
+            for conn in socks:
+                k, addr = conn.recvfrom(65535)
+                srcif = None
+                for sock in self.sockets:
+                    if self.sockets[sock] == conn:
+                        srcif = sock
+                        break
+                msg = k.decode('utf-8')
+                self.parseJSON(msg)
+
+    '''
+    Parses the given JSON message.
+    Params:
+        msg - the JSON message to parse
+    ''' 
+    def parseJSON(self, msg):
+        json_msg = json.loads(msg)
+        src = json_msg.get('src')
+        dst = json_msg.get('dst')
+        type = json_msg.get('type')
+        contents = json_msg.get('msg')
+        if type == 'update' or type == 'handshake':
+            self.update_messages.append(msg)
+            self.update_table(src, contents, type)
+        elif type == 'data':
+            self.forward_msg(src, dst, msg)
+        elif type == 'dump':
+            self.sendTable(src)
+        elif type == 'withdraw':
+            self.withdraw(src, contents[0])
+
+    '''
+    Withdraws the given message from the forwarding table and updates neighbors if necessary.
+    Params:
+        src - the network that sent the message
+        contents - the contents of the message
+    '''
+    def withdraw(self, src, contents):
+        for entry in self.update_messages:
+            json_entry = json.loads(entry)
+            if json_entry['msg']['network'] == contents['network'] and json_entry['msg']['netmask'] == contents['netmask']:
+                self.sendWithdraw(src, contents)
+                self.update_messages.remove(entry)
+                self.rebuildTable()
+                return
+
+    '''
+    Rebuilds the forwarding table from the update messages.
+    '''
+    def rebuildTable(self):
+        self.forwarding_table = []
+        for update in self.update_messages:
+            json_update = json.loads(update)
+            self.update_table(json_update['src'], json_update['msg'], json_update['type'], update_neighbors=False)
+
+    '''
+    Removes the given message from the update messages.
+    Params:
+        contents - the contents of the message
+    '''
+    def remove_update_message(self, contents):
+        for update in self.update_messages:
+            json_update = json.loads(update)
+            if json_update['msg']['network'] == contents['network'] and json_update['msg']['netmask'] == contents['netmask']:
+                self.update_messages.remove(update)
+                return
+
+    '''
+    Sends a withdraw message to the neighbors of this router.
+    Params:
+        src - the network that sent the message
+        contents - the contents of the message
+    '''      
+    def sendWithdraw(self, src, contents):
+        for neighbor in self.sockets:
+            if neighbor != src:
+                msg = json.dumps({
+                    "msg": [contents],
+                    "type": "withdraw",
+                    "src": self.our_addr(neighbor),
+                    "dst": neighbor})
+                self.send(neighbor, msg)
+
+    '''
+    Updates the forwarding table of this router.
+    Params:
+        src - the network that sent the message
+        contents - the contents of the message
+        type - the type of the message
+    '''
+    def update_table(self, src, contents, type, update_neighbors=True):
+        AS_path = contents['ASPath']
+        if type == 'update' and AS_path:
+            AS_path = [self.asn] + contents['ASPath']
+        else:
+            AS_path = [self.asn]
+        new_entry = self.createTableEntry(src, contents, AS_path)
+        self.forwarding_table.append(new_entry)
+        if update_neighbors:
+            self.update_neighbors(src, contents, AS_path)
+        self.aggregateTable()
+
+    '''
+    Sends an update message to the neighbors of this router.
+    Params:
+        src - the network that sent the message
+        contents - the contents of the message
+        AS_path - the AS path of the message
+    '''
+    def update_neighbors(self, src, contents, AS_path):
+        for neighbor in self.sockets:
+            if  neighbor != src and (self.relations[src] == 'cust' or self.relations[neighbor] == 'cust'):
+                msg = json.dumps({
+                    "msg": { 
+                        "netmask": contents['netmask'],
+                        "ASPath": AS_path,
+                        "network": contents['network']},
+                    "type": "update",
+                    "src": self.our_addr(neighbor),
+                    "dst": neighbor})
+                self.send(neighbor, msg)
+
+    '''
+    Creates a new entry for the forwarding table.
+    Params:
+        src - the network that sent the message
+        contents - the contents of the message
+        AS_path - the AS path of the message
+    Returns:
+        the new entry for the forwarding table
+    '''
+    def createTableEntry(self, src, contents, AS_path):
+        return {
+            'origin' : contents['origin'],
+            'localpref' : contents['localpref'],
+            'network' : contents['network'],
+            'ASPath' : AS_path,
+            'netmask' : contents['netmask'],
+            'peer' : src,
+            'selfOrigin' : contents['selfOrigin'],   
+        } 
+
+    '''
+    Aggregates the forwarding table.
+    '''
+    def aggregateTable(self):
+        ascending_ips = sorted(self.forwarding_table, key=lambda entry: self.ip_to_int(entry['network']))
+        for entry in ascending_ips:
+            self.aggregateEntry(entry)
+
+    '''
+    Aggregates the given entry with the other entries in the forwarding table.
+    Params:
+        entry - the entry to aggregate
+    '''
+    def aggregateEntry(self, entry):
+        for other_entry in self.forwarding_table:
+            if entry != other_entry \
+            and self.ips_can_aggregate(entry, other_entry) \
+            and self.sameAttributes(entry, other_entry):
+                if self.ip_to_int(entry['network']) > self.ip_to_int(other_entry['network']):
+                    entry, other_entry = other_entry, entry
+                self.forwarding_table.remove(other_entry)
+                if entry['network'] != other_entry['network']:
+                    entry['netmask'] = self.shorten_netmask(entry['netmask'])
+            else:
+                if entry != other_entry and self.sameAttributes:
+                    self.ips_can_aggregate(entry, other_entry)
+
+    '''
+    Determines if the two given entries can be aggregated based on their IP addresses and subnet mask.
+    Params:
+        entry1 - the first entry to check
+        entry2 - the second entry to check
+    Returns:
+        true if the entries can be aggregated, false otherwise
+    '''
+    def ips_can_aggregate(self, entry1, entry2):
+        min, max = self.calculate_ip_range(entry1['network'], entry1['netmask'])
+        return self.ip_to_int(min) <= self.ip_to_int(entry2['network']) \
+            and self.ip_to_int(entry2['network']) <= (self.ip_to_int(max) + 1)
+
+    '''
+    Calculates the IP range of the given IP address and subnet mask.
+    Params:
+        ip_address - the IP address to calculate the range of
+        subnet_mask - the subnet mask to calculate the range of
+    Returns:
+        the starting and last IP addresses of the range
+    '''
+    def calculate_ip_range(self, ip_address, subnet_mask):
+        ip_parts = [int(part) for part in ip_address.split('.')]
+        subnet_parts = [int(part) for part in subnet_mask.split('.')]
+        starting_address = [ip_parts[i] & subnet_parts[i] for i in range(4)]
+        last_address = [(ip_parts[i] | ~subnet_parts[i]) & 255 for i in range(4)]
+        starting_address_str = '.'.join(map(str, starting_address))
+        last_address_str = '.'.join(map(str, last_address))
+        return starting_address_str, last_address_str
+
+    '''
+    Checks if the given entries have the same attributes.
+    Params:
+        entry - the first entry to check
+        other_entry - the second entry to check
+    Returns:
+        true if the entries have the same attributes, false otherwise
+    '''
+    def sameAttributes(self, entry, other_entry):
+        return entry['origin'] == other_entry['origin'] \
+            and entry['localpref'] == other_entry['localpref'] \
+            and entry['netmask'] == other_entry['netmask'] \
+            and entry['ASPath'] == other_entry['ASPath'] \
+            and entry['selfOrigin'] == other_entry['selfOrigin'] \
+            and entry['peer'] == other_entry['peer'] 
+    
+    '''
+    Converts the given IP address to an integer.
+    Params:
+        ip - the IP address to convert
+    Returns:
+        the integer representation of the given IP address'''
+    def ip_to_int(self, ip):
+        parts = ip.split('.')
+        return (int(parts[0]) << 24) + (int(parts[1]) << 16) + (int(parts[2]) << 8) + int(parts[3])
+
+    '''
+    Converts the given integer to an IP address.
+    Params:
+        num - the integer to convert
+    Returns:
+        a string of the IP address from the given integer'''
+    def int_to_ip(self, num):
+        return ".".join(str((num >> i) & 0xFF) for i in (24, 16, 8, 0))
+    
+    '''
+    Adds one to the given IP address.
+    Params:
+        ip - the IP address to add one to
+    Returns:
+        a string of the IP address with one added to it'''
+    def add_one_to_ip(self, ip):
+        return self.int_to_ip(self.ip_to_int(ip) + 1)
+    
+    '''
+    Converts the given CIDR value to netmask notation.
+    Params:
+        cidr - the CIDR value to convert
+    Returns:
+        a string of the netmask notation of the given CIDR value'''
+    def cidr_to_netmask(self, cidr):
+        if cidr > 0:
+            netmask = (0xFFFFFFFF << (32 - cidr)) & 0xFFFFFFFF
+            netmask_parts = [(netmask >> 24) & 0xFF, (netmask >> 16) & 0xFF, (netmask >> 8) & 0xFF, netmask & 0xFF]
+            return '.'.join(str(part) for part in netmask_parts)
+        else:
+            return "255.255.255.255"
+    
+    '''
+    Converts the given netmask to an integer representing the CIDR value.
+    Params:
+        netmask - the netmask to convert
+    Returns:
+        the CIDR integer of the given netmask'''
+    def netmask_to_cidr(self, netmask):
+        netmask_binary = ''.join(format(int(x), '08b') for x in netmask.split('.'))
+        cidr = 0
+        for bit in netmask_binary:
+            if bit == '1':
+                cidr += 1
+        return cidr
+
+    '''
+    Shortens the given netmask by one.
+    Params:
+        netmask - the netmask to shorten
+    Returns:
+        the shortened netmask'''
+    def shorten_netmask(self, netmask):
+        new_cidr = self.netmask_to_cidr(netmask) - 1 if self.netmask_to_cidr(netmask) > 0 else 0
+        return self.cidr_to_netmask(new_cidr)
+    
+    '''
+    Lengthens the given netmask by one.
+    Params:
+        netmask - the netmask to lengthen
+    Returns:
+        the lengthened netmask'''
+    def lengthen_netmask(self, netmask):
+        new_cidr = self.netmask_to_cidr(netmask) + 1 if self.netmask_to_cidr(netmask) < 32 else 32
+        return self.cidr_to_netmask(new_cidr)
+
+    '''
+    Forwards the given message to the given destination.
+    Params:
+        src - the network that sent the message
+        dst - the destination of the message
+        msg - the message to forward
+    '''
+    def forward_msg(self, src, dst, msg):
+        entries = self.checkForwardingTable(dst)
+        if entries:
+            entry = self.chooseEntry(entries, dst)
+            peer = entry['peer']
+            self.sendIfCust(src, peer, msg)
+        else:
+            entries_in_range = self.find_ips_in_range(dst)
+            if entries_in_range:
+                entry = self.chooseEntry(entries_in_range, dst)
+                peer = entry['peer']
+                self.sendIfCust(src, peer, msg)
+            else:
+                closest_source = self.findLongestPrefixMatch(self.find_ips_in_range(src), src)
+                self.send(closest_source[0]['peer'], self.getNoRouteMSG(src, dst))
+
+    '''
+    Sends the given message to the given destination if the destination is a customer.
+    Params:
+        src - the network that sent the message
+        dst - the destination of the message
+        msg - the message to forward
+    '''
+    def sendIfCust(self, src, dst, msg):
+        in_range_of_source = self.find_ips_in_range(src)
+        if in_range_of_source:
+            closest_source = self.findLongestPrefixMatch(in_range_of_source, src)
+            source_relation = self.relations[closest_source[0]['peer']]
+        else:
+            source_relation = 'unknown'
+        if self.relations[dst] == 'cust' or source_relation == 'cust':
+            self.send(dst, msg)
+        else:
+            self.send(closest_source[0]['peer'], self.getNoRouteMSG(src, dst))
+
+    '''
+    Creates a JSON formatted no route message.
+    Params:
+        src - the source of this message
+        dst - the destination of this message
+    Returns:
+        the no route message
+    '''
+    def getNoRouteMSG(self, src, dst):
+        return json.dumps({
+                        "msg": [],
+                        "type": "no route",
+                        "src": src,
+                        "dst": dst})
+
+    '''
+    Finds the entries in the forwarding table that are in range of the given destination.
+    Params:
+        dst - the destination to find the entries for
+    Returns:
+        the entries in the forwarding table that are in range of the given destination
+    '''
+    def find_ips_in_range(self, dst):
+        entries = []
+        for entry in self.forwarding_table:
+            if self.check_ip_range(dst, entry['network'], entry['netmask']):
+                entries.append(entry)
+        return entries if entries else None
+    
+    '''
+    Converts the given IP address to binary and checks if it is in range of the given prefix and netmask.
+    Params:
+        dst - the IP address to check
+        prefix - the prefix of the network
+        netmask - the netmask of the network
+    '''
+    def check_ip_range(self, dst, prefix, netmask):
+        dst_binary = ''.join(format(int(x), '08b') for x in dst.split('.'))
+        prefix_binary = ''.join(format(int(x), '08b') for x in prefix.split('.'))
+        netmask_binary = ''.join(format(int(x), '08b') for x in netmask.split('.'))
+        ip = ''.join([str(int(ip) & int(mask)) for ip, mask in zip(dst_binary, netmask_binary)])
+        return ip.startswith(prefix_binary)
+
+    '''
+    Chooses the entry to forward the message to based on a hierarchy of criteria.
+    Params:
+        entries - the entries to choose from
+        dst - the destination of the message
+    Returns:
+        the entry to forward the message to
+    '''
+    def chooseEntry(self, entries, dst):
+        if len(entries) == 1:
+            return entries[0]
+        entries = self.findLongestPrefixMatch(entries, dst)
+        if len(entries) == 1:
+            return entries[0]
+        entries = self.findHighestPref(entries)
+        if len(entries) == 1:
+            return entries[0]
+        entries = self.findTrueOrigin(entries)
+        if len(entries) == 1:
+            return entries[0]
+        entries = self.findShortestASPath(entries)
+        if len(entries) == 1:
+            return entries[0]
+        entries = self.findBestOrigin(entries)
+        if len(entries) == 1:
+            return entries[0]
+        entries = self.findLowestIP(entries)
+        return entries[0]
+
+    '''
+    Finds the longest prefix match for the given destination if there is one.
+    Params:
+        dst - the destination to find the longest prefix match for
+    Returns:
+        A list of the longest prefix match entry (multiple if tied)
+    '''
+    def findLongestPrefixMatch(self, entries, dst):
+        longest_prefix = [entries[0]]
+        for entry in entries[1:]:
+            len_longest_prefix = self.checkPrefixMatch(longest_prefix[0]['network'], dst)
+            len_entry_prefix = self.checkPrefixMatch(entry['network'], dst)
+            if len_longest_prefix == len_entry_prefix:
+                longest_prefix.append(entry)
+            elif len_longest_prefix < len_entry_prefix:
+                longest_prefix = [entry]
+        return longest_prefix
+    
+    '''
+    Finds the highest 'localpref' for the given entries.
+    Params:
+        entries - the entries to find the highest localpref for
+    Returns:
+        A list of the entries with the highest localpref (multiple if tied)
+    '''
+    def findHighestPref(self, entries):
+        highest_pref = [entries[0]]
+        for entry in entries[1:]:
+            val_highest_pref = int(highest_pref[0]['localpref'])
+            val_entry_pref = int(entry['localpref'])
+            if val_highest_pref == val_entry_pref:
+                highest_pref.append(entry)
+            elif val_highest_pref < val_entry_pref:
+                highest_pref = [entry]
+        return highest_pref
+    
+    '''
+    Finds the entries that have 'selfOrigin' set to true.
+    Params:
+        entries - the entries to find the true origin for
+    Returns:
+        A list of the entries that have 'selfOrigin' set to true, or, if none, a list of the original entries
+    '''
+    def findTrueOrigin(self, entries):
+        true_origin = []
+        for entry in entries:
+            if entry['selfOrigin']:
+                true_origin.append(entry)
+        return true_origin if true_origin else entries
+    
+    '''
+    Find the entries that have the shortest AS path.
+    Params:
+        entries - the entries to find the shortest AS path for
+    Returns:
+        A list of the entries that have the shortest AS path (multiple if tied)
+    '''
+    def findShortestASPath(self, entries):
+        shortest_path = [entries[0]]
+        for entry in entries[1:]:
+            len_shortest_path = len(shortest_path[0]['ASPath'])
+            len_entry_path = len(entry['ASPath'])
+            if len_shortest_path == len_entry_path:
+                shortest_path.append(entry)
+            elif len_shortest_path > len_entry_path:
+                shortest_path = [entry]
+        return shortest_path
+    
+    '''
+    Finds the entries that have the best origin. (IGP > EGP > UNK)
+    Params:
+        entries - the entries to find the best origin for
+    Returns:
+        A list of the entries that have the best origin (multiple if tied)
+    '''
+    def findBestOrigin(self, entries):
+        best_origin = [entries[0]]
+        hierarchy = { 'IGP' : 0, 'EGP' : 1, 'UNK' : 2 }
+        for entry in entries[1:]:
+            val_best_origin = hierarchy.get(best_origin[0]['origin'])
+            val_entry_origin = hierarchy.get(entry['origin'])
+            if val_best_origin == val_entry_origin:
+                best_origin.append(entry)
+            elif val_best_origin > val_entry_origin:
+                best_origin = [entry]
+        return best_origin
+    
+    '''
+    Finds the entry that has the lowest IP address.
+    Params:
+        entries - the entries to find the lowest IP address for
+    Returns:
+        A list of the single entry with the lowest IP address
+    '''
+    def findLowestIP(self, entries):
+        lowest_ip = [entries[0]]
+        for entry in entries[1:]:
+            val_lowest_ip = int(''.join(format(int(x), '08b') for x in lowest_ip[0]['peer'].split('.')))
+            val_entry_ip = int(''.join(format(int(x), '08b') for x in entry['peer'].split('.')))
+            if val_lowest_ip == val_entry_ip:
+                lowest_ip.append(entry)
+            elif val_lowest_ip > val_entry_ip:
+                lowest_ip = [entry]
+        return lowest_ip
+
+    
+    '''
+    Checks the prefix match between the given left and right.
+    Params:
+        addr1 - the first address of the prefix match
+        addr2 - the right side of the prefix match
+    '''
+    def checkPrefixMatch(self, addr1, addr2):
+        addr1_binary = ''.join(format(int(x), '08b') for x in addr1.split('.'))
+        addr2_binary = ''.join(format(int(x), '08b') for x in addr2.split('.'))
+        prefix_len = 0
+        for i in range(len(addr1_binary)):
+            if addr1_binary[i] == addr2_binary[i]:
+                prefix_len += 1
+            else:
+                break
+        return prefix_len
+
+    '''
+    Checks the forwarding table for the given destination.
+    Params:
+        dst - the destination to check the forwarding table for
+    Returns:
+        the entries in the forwarding table that match the given destination
+    '''
+    def checkForwardingTable(self, dst):
+        entries = []
+        for entry in self.forwarding_table:
+            if entry['network'] == dst:
+                entries.append(entry)
+        return entries if entries else None
+
+    '''
+    Sends the forwarding table back to the source.
+    Params:
+        src - the source to send the forwarding table to
+    '''
+    def sendTable(self, src):
+        modified_forwarding_table = []
+        for entry in self.forwarding_table:
+            modified_entry = entry.copy()
+            if modified_entry['ASPath']:
+                modified_entry['ASPath'] = modified_entry['ASPath'][1:]
+            modified_forwarding_table.append(modified_entry)
+        for neighbor in self.sockets:
+            msg = json.dumps({
+                "msg": modified_forwarding_table,
+                "type": "table",
+                "src": self.our_addr(neighbor),
+                "dst": neighbor})
+            self.send(src, msg)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='route packets')
+    parser.add_argument('asn', type=int, help="AS number of this router")
+    parser.add_argument('connections', metavar='connections', type=str, nargs='+', help="connections")
+    args = parser.parse_args()
+    router = Router(args.asn, args.connections)
+    router.run()
